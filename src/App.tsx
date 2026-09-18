@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import CueTable, { type FilterMode } from './components/CueTable'
+import CutPanel from './components/CutPanel'
 import MergePanel from './components/MergePanel'
 import PlanImportDialog from './components/PlanImportDialog'
 import VideoPreview from './components/VideoPreview'
@@ -15,11 +16,31 @@ import { activeLines, seekTargetSec } from './lib/sync'
 import { formatTime, parseTime } from './lib/time'
 import { parsePlan, previewPlan, serializePlan, type PlanPreview } from './lib/plan'
 import { buildMergedSrt, computeMergePlan, type MergePlan } from './lib/merge'
+import {
+  buildCutSrt,
+  computeCutPlan,
+  parseCutList,
+  type CutItemError,
+  type CutRange,
+} from './lib/cut'
 import { SAMPLE_SRT } from './sample'
 
 interface Notice {
   level: 'info' | 'error'
   text: string
+}
+
+/** 当前生效的删减清单（上次校验通过的导入结果）。 */
+interface CutListState {
+  fileName: string
+  itemCount: number
+  ranges: CutRange[]
+}
+
+/** 上一次非法删减清单的逐项报错（不覆盖有效结果）。 */
+interface CutErrorState {
+  fileName: string
+  errors: CutItemError[]
 }
 
 export default function App() {
@@ -37,10 +58,13 @@ export default function App() {
   const [playMs, setPlayMs] = useState(0)
   const [secCues, setSecCues] = useState<Cue[] | null>(null)
   const [secFileName, setSecFileName] = useState('')
+  const [cutList, setCutList] = useState<CutListState | null>(null)
+  const [cutErrors, setCutErrors] = useState<CutErrorState | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
   const planFileRef = useRef<HTMLInputElement>(null)
   const videoFileRef = useRef<HTMLInputElement>(null)
   const secFileRef = useRef<HTMLInputElement>(null)
+  const cutFileRef = useRef<HTMLInputElement>(null)
   const videoRef = useRef<HTMLVideoElement | null>(null)
   /** 当前持有的视频对象 URL，用于在替换 / 卸载 / 组件卸载时精确释放。 */
   const videoUrlRef = useRef<string | null>(null)
@@ -74,6 +98,15 @@ export default function App() {
   }, [lines, secCues])
   const mergePlan = mergeResult.plan
   const mergeError = mergeResult.error
+
+  /**
+   * 删减重排：基于校准后的主时间轴（lines）与当前有效删减清单计算；
+   * 锚点任何变化都会改变 lines，从而实时重算，且不影响锚点与双语合并状态。
+   */
+  const cutPlan = useMemo(
+    () => (cues && cutList ? computeCutPlan(lines, cutList.ranges) : null),
+    [cues, lines, cutList],
+  )
 
   const flash = useCallback((n: Notice) => {
     setNotice(n)
@@ -161,6 +194,9 @@ export default function App() {
       // 主轨已整体替换，次轨不再适用
       setSecCues(null)
       setSecFileName('')
+      // 删减清单同样失效
+      setCutList(null)
+      setCutErrors(null)
       // 保留已载入的视频，但重置播放位置
       const video = videoRef.current
       if (video) {
@@ -377,6 +413,26 @@ export default function App() {
     URL.revokeObjectURL(url)
   }, [])
 
+  const unloadCut = useCallback(() => {
+    setCutList(null)
+    setCutErrors(null)
+    flash({ level: 'info', text: '已移除删减清单，恢复完整校准结果。' })
+  }, [flash])
+
+  /** 导出删减重排后的独立 SRT：仅保留片段，按结果顺序从 1 重编号。 */
+  const exportCutSrt = useCallback(() => {
+    if (!cues || !cutPlan || !cutList) return
+    const payload = buildCutSrt(cutPlan)
+    const base = fileName.replace(/\.srt$/i, '') || 'subtitles'
+    downloadFile(payload, `${base}.cut.srt`, 'text/plain;charset=utf-8')
+    flash({
+      level: 'info',
+      text:
+        `已导出删减重排 SRT：${cutPlan.output.length} 条按结果顺序从 1 重编号` +
+        `（移除 ${cutPlan.removedCount} 条、拆分 ${cutPlan.splitCount} 条、位移 ${cutPlan.shiftedCount} 条）。`,
+    })
+  }, [cues, cutPlan, cutList, fileName, downloadFile, flash])
+
   const exportPlan = useCallback(() => {
     if (!cues || anchors.length === 0) return
     const payload = serializePlan(cues, anchors)
@@ -392,34 +448,102 @@ export default function App() {
     })
   }, [cues, anchors, fileName, downloadFile, flash])
 
-  const openPlanFile = useCallback(
-    (file: File) => {
+  /** 解析并预览锚点方案 JSON 内容（来自按钮选择或拖拽）。 */
+  const applyPlanContent = useCallback(
+    (content: string, name: string) => {
       if (!cues) {
         flash({ level: 'error', text: '请先导入（修订版）SRT 字幕，再导入锚点方案。' })
         return
       }
-      const reader = new FileReader()
-      reader.onload = () => {
-        const result = parsePlan(String(reader.result ?? ''))
-        if ('error' in result) {
-          flash({ level: 'error', text: `方案文件被拒绝：${result.error.message}` })
-          return
-        }
-        const preview = previewPlan(result.plan, cues)
-        setPlanPreview(preview)
-        setPlanFileName(file.name)
-        flash({
-          level: 'info',
-          text:
-            `方案预览：${preview.validCount} 个锚点可应用（直接匹配 ${preview.entries.filter((e) => e.status === 'direct').length}、` +
-            `文本迁移 ${preview.entries.filter((e) => e.status === 'migrated').length}），` +
-            `${preview.conflictCount} 个冲突项不会应用。请在弹窗中确认。`,
-        })
+      const result = parsePlan(content)
+      if ('error' in result) {
+        flash({ level: 'error', text: `方案文件被拒绝：${result.error.message}` })
+        return
       }
+      const preview = previewPlan(result.plan, cues)
+      setPlanPreview(preview)
+      setPlanFileName(name)
+      flash({
+        level: 'info',
+        text:
+          `方案预览：${preview.validCount} 个锚点可应用（直接匹配 ${preview.entries.filter((e) => e.status === 'direct').length}、` +
+          `文本迁移 ${preview.entries.filter((e) => e.status === 'migrated').length}），` +
+          `${preview.conflictCount} 个冲突项不会应用。请在弹窗中确认。`,
+      })
+    },
+    [cues, flash],
+  )
+
+  const openPlanFile = useCallback(
+    (file: File) => {
+      const reader = new FileReader()
+      reader.onload = () => applyPlanContent(String(reader.result ?? ''), file.name)
       reader.onerror = () => flash({ level: 'error', text: '读取方案文件失败。' })
       reader.readAsText(file)
     },
-    [cues, flash],
+    [applyPlanContent, flash],
+  )
+
+  /** 应用删减清单 JSON 内容：非法清单逐项报错，且不覆盖上次有效结果。 */
+  const applyCutContent = useCallback(
+    (content: string, name: string) => {
+      if (!cues) {
+        flash({ level: 'error', text: '请先导入主 SRT 并完成锚点校准，再导入删减清单。' })
+        return
+      }
+      const result = parseCutList(content)
+      if ('errors' in result) {
+        setCutErrors({ fileName: name, errors: result.errors })
+        flash({
+          level: 'error',
+          text:
+            `删减清单「${name}」存在 ${result.errors.length} 处非法项，已整单拒绝` +
+            (cutList ? '，上次有效结果保持不变。' : '。'),
+        })
+        return
+      }
+      const total = result.ranges.reduce((acc, r) => acc + (r.end - r.start), 0)
+      setCutList({ fileName: name, itemCount: result.itemCount, ranges: result.ranges })
+      setCutErrors(null)
+      flash({
+        level: 'info',
+        text:
+          `已导入删减清单「${name}」：${result.itemCount} 项合并为 ${result.ranges.length} 个删减区间` +
+          `（共 ${formatTime(total)}），重排结果随锚点实时重算。`,
+      })
+    },
+    [cues, cutList, flash],
+  )
+
+  const openCutFile = useCallback(
+    (file: File) => {
+      const reader = new FileReader()
+      reader.onload = () => applyCutContent(String(reader.result ?? ''), file.name)
+      reader.onerror = () => flash({ level: 'error', text: '读取删减清单文件失败。' })
+      reader.readAsText(file)
+    },
+    [applyCutContent, flash],
+  )
+
+  /** 拖入的 .json 按内容分发：顶层为数组 → 删减清单；否则 → 锚点方案。 */
+  const openJsonFile = useCallback(
+    (file: File) => {
+      const reader = new FileReader()
+      reader.onload = () => {
+        const text = String(reader.result ?? '')
+        let isCutList = false
+        try {
+          isCutList = Array.isArray(JSON.parse(text))
+        } catch {
+          // 非法 JSON 交给锚点方案解析器统一报告
+        }
+        if (isCutList) applyCutContent(text, file.name)
+        else applyPlanContent(text, file.name)
+      }
+      reader.onerror = () => flash({ level: 'error', text: '读取文件失败。' })
+      reader.readAsText(file)
+    },
+    [applyCutContent, applyPlanContent, flash],
   )
 
   const applyPlan = useCallback(() => {
@@ -455,12 +579,12 @@ export default function App() {
       const file = e.dataTransfer.files?.[0]
       if (!file) return
       if (/\.json$/i.test(file.name)) {
-        openPlanFile(file)
+        openJsonFile(file)
       } else {
         onFile(file)
       }
     },
-    [onFile, openPlanFile],
+    [onFile, openJsonFile],
   )
 
   return (
@@ -560,6 +684,29 @@ export default function App() {
             }
           >
             {secCues ? '替换次轨 SRT' : '导入次轨 SRT（双语合并）'}
+          </button>
+          <input
+            ref={cutFileRef}
+            type="file"
+            accept=".json,application/json"
+            hidden
+            onChange={(e) => {
+              const f = e.target.files?.[0]
+              if (f) openCutFile(f)
+              e.target.value = ''
+            }}
+          />
+          <button
+            className="btn"
+            disabled={!cues}
+            onClick={() => cutFileRef.current?.click()}
+            title={
+              cues
+                ? '导入删减清单（JSON 数组，每项含 start/end 两个 SRT 时间），从校准后的字幕中扣除删减段并重排'
+                : '请先导入并校准主 SRT'
+            }
+          >
+            {cutList ? '替换删减清单' : '导入删减清单'}
           </button>
           <button className="btn btn-danger-outline" disabled={!cues || hasErrors} onClick={exportSrt}>
             导出新 SRT
@@ -661,6 +808,20 @@ export default function App() {
                 </button>
               </div>
             ))}
+          {(cutList || cutErrors) && (
+            <CutPanel
+              plan={cutPlan}
+              fileName={cutList?.fileName ?? ''}
+              itemCount={cutList?.itemCount ?? 0}
+              errors={cutErrors?.errors ?? null}
+              errorFileName={cutErrors?.fileName ?? ''}
+              mainHasErrors={hasErrors}
+              mainErrorCount={errorCount}
+              onReplace={() => cutFileRef.current?.click()}
+              onUnload={unloadCut}
+              onExport={exportCutSrt}
+            />
+          )}
           <CueTable
             lines={lines}
             anchors={anchors}
@@ -690,7 +851,7 @@ export default function App() {
         />
       )}
 
-      {dragging && <div className="drop-mask">松开以导入文件（.srt 字幕 / .json 锚点方案）</div>}
+      {dragging && <div className="drop-mask">松开以导入文件（.srt 字幕 / .json 锚点方案或删减清单）</div>}
     </div>
   )
 }
