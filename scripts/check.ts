@@ -10,6 +10,7 @@ import {
   type AnchorPlan,
 } from '../src/lib/plan'
 import { buildMergedSrt, computeMergePlan, legalEdge } from '../src/lib/merge'
+import { buildCutSrt, computeCutPlan, mergeCuts, parseCutList, removedBefore } from '../src/lib/cut'
 import { SAMPLE_SRT } from '../src/sample'
 
 let failures = 0
@@ -749,6 +750,273 @@ console.log('双语合并：确定性小规模穷举对拍（最优重叠/时差
     }
   }
   assert(fuzzFail === 0, `400 组随机输入与穷举最优解完全一致（偏差组数 ${fuzzFail}）`)
+}
+
+// ---- 删减清单重排：清单解析与逐项校验 ----
+console.log('删减清单：解析校验')
+{
+  const r = parseCutList(
+    JSON.stringify([
+      { start: '00:00:10,000', end: '00:00:20,000' },
+      { start: '00:01:00,000', end: '00:01:10,500' },
+    ]),
+  )
+  assert('items' in r && r.items.length === 2, '合法数组解析为 2 项')
+}
+{
+  const r = parseCutList('{not json')
+  assert('errors' in r && r.errors[0].code === 'invalid-json', '非法 JSON 拒绝')
+}
+{
+  const r = parseCutList('{}')
+  assert('errors' in r && r.errors[0].code === 'invalid-shape', '顶层非数组拒绝')
+}
+{
+  const r = parseCutList('[]')
+  assert('errors' in r && r.errors.some((e) => e.code === 'empty-list'), '空清单拒绝')
+}
+{
+  // 逐项报错：未知字段 + start 非字符串 + end 无法解析 + end<=start + 非对象
+  const r = parseCutList(
+    JSON.stringify([
+      { start: '00:00:10,000', end: '00:00:20,000', extra: 1 },
+      { start: 10000, end: '00:00:20,000' },
+      { start: '00:00:10,000', end: 'bad' },
+      { start: '00:00:20,000', end: '00:00:20,000' },
+      'x',
+    ]),
+  )
+  assert('errors' in r, '含非法项的整体清单被拒绝')
+  assert('errors' in r && r.errors.length === 5, `逐项收集错误（实际 ${'errors' in r ? r.errors.length : 0}）`)
+  assert(
+    'errors' in r && r.errors.every((e) => e.message.startsWith('第 ')),
+    '错误信息逐项标注序号（1 起）',
+  )
+}
+{
+  // 一项非法不应产出部分 items：整单拒绝由上层保留上次有效结果
+  const r = parseCutList(
+    JSON.stringify([
+      { start: '00:00:10,000', end: '00:00:20,000' },
+      { start: '00:00:30,000', end: '00:00:20,000' },
+    ]),
+  )
+  assert('errors' in r && !('items' in r), '任一非法项时不返回部分有效项')
+}
+{
+  const r = parseCutList(JSON.stringify([{ start: '00:00:01.500', end: '00:00:02,000' }]))
+  assert('items' in r, '点号毫秒分隔的时间可接受')
+}
+{
+  // 乱序、重叠、相接的输入交给 mergeCuts；解析器本身不要求有序
+  const r = parseCutList(
+    JSON.stringify([
+      { start: '00:00:30,000', end: '00:00:40,000' },
+      { start: '00:00:10,000', end: '00:00:20,000' },
+    ]),
+  )
+  assert('items' in r && r.items.length === 2, '解析不要求清单有序')
+}
+
+// ---- 排序与合并 ----
+console.log('删减清单：排序并合并相交/相接区间')
+{
+  const r = parseCutList(
+    JSON.stringify([
+      { start: '00:00:30,000', end: '00:00:42,000' }, // 与 [20,40] 相交
+      { start: '00:00:10,000', end: '00:00:20,000' },
+      { start: '00:00:20,000', end: '00:00:40,000' }, // 与首段相接
+      { start: '00:01:00,000', end: '00:01:05,000' }, // 独立段
+      { start: '00:01:02,000', end: '00:01:03,000' }, // 被包含
+    ]),
+  )
+  const ranges = 'items' in r ? mergeCuts(r.items) : []
+  assert(ranges.length === 2, `合并为 2 段（实际 ${ranges.length}）`)
+  assert(ranges[0].start === 10000 && ranges[0].end === 42000, '相交/相接/被包含合并为 [10s,42s]')
+  assert(ranges[1].start === 60000 && ranges[1].end === 65000, '独立段保留 [60s,65s]')
+}
+
+// ---- 累计删减时长 ----
+console.log('删减清单：累计删减时长（末端相等不计入）')
+{
+  const ranges = mergeCuts(
+    (parseCutList(
+      JSON.stringify([
+        { start: '00:00:10,000', end: '00:00:20,000' },
+        { start: '00:00:30,000', end: '00:00:40,000' },
+      ]),
+    ) as { items: { start: string; end: string }[] }).items,
+  )
+  assert(removedBefore(ranges, 5000) === 0, '删减段之前为 0')
+  assert(removedBefore(ranges, 15000) === 0, '位于第一段之内为 0')
+  assert(removedBefore(ranges, 20000) === 10000, '恰在第一段末端：计入 10s')
+  assert(removedBefore(ranges, 35000) === 10000, '第二段之内仍只计 10s')
+  assert(removedBefore(ranges, 40000) === 20000, '第二段末端计入 20s')
+}
+
+// ---- 扣除重排 ----
+console.log('删减清单：移除 / 拆分 / 前移 / 保留')
+const cutItems2 = (
+  parseCutList(
+    JSON.stringify([
+      { start: '00:00:10,000', end: '00:00:20,000' },
+      { start: '00:00:30,000', end: '00:00:44,000' },
+    ]),
+  ) as { items: { start: string; end: string }[] }
+).items
+const cutRanges = mergeCuts(cutItems2)
+const cutLines = [
+  mkMain(0, 0, 8000, 'A'), // 删减之前：原样保留
+  mkMain(1, 8000, 25000, 'B'), // 跨越第一段边界：拆成 [8,10) 与 [20,25)
+  mkMain(2, 26000, 28000, 'C'), // 第一段之后：整段前移 10s
+  mkMain(3, 30000, 38000, 'D'), // 完全落入第二段：移除
+  mkMain(4, 44000, 50000, 'E'), // 从第二段末端开始：前移 24s
+]
+{
+  const plan = computeCutPlan(cutLines, cutRanges)
+  const st = plan.results.map((x) => x.status).join(',')
+  assert(st === 'kept,split,shifted,removed,shifted', `处置序列正确（实际 ${st}）`)
+  assert(
+    plan.removed === 1 && plan.split === 1 && plan.shifted === 2 && plan.kept === 1,
+    '移除/拆分/前移/保留计数正确',
+  )
+  assert(plan.fragmentCount === 5, `导出片段共 5 条（实际 ${plan.fragmentCount}）`)
+
+  const a = plan.results[0]
+  assert(
+    a.fragments.length === 1 &&
+      a.fragments[0].outStart === 0 &&
+      a.fragments[0].outEnd === 8000 &&
+      a.fragments[0].shift === 0,
+    'A 原样保留、不平移',
+  )
+
+  const b = plan.results[1]
+  assert(b.fragments.length === 2 && b.fragments.every((f) => f.text === 'B'), 'B 拆成 2 个非空片段且文本均保留为 B')
+  assert(
+    b.fragments[0].segStart === 8000 &&
+      b.fragments[0].segEnd === 10000 &&
+      b.fragments[0].outStart === 8000 &&
+      b.fragments[0].outEnd === 10000,
+    'B 片段 1：[8s,10s)，此前删减为 0 不平移',
+  )
+  assert(
+    b.fragments[1].segStart === 20000 &&
+      b.fragments[1].segEnd === 25000 &&
+      b.fragments[1].outStart === 10000 &&
+      b.fragments[1].outEnd === 15000 &&
+      b.fragments[1].shift === 10000,
+    'B 片段 2：[20s,25s) 按累计删减 10s 前移到 [10s,15s)',
+  )
+
+  const c = plan.results[2]
+  assert(
+    c.fragments[0].segStart === 26000 &&
+      c.fragments[0].outStart === 16000 &&
+      c.fragments[0].outEnd === 18000,
+    'C [26s,28s) 前移 10s 到 [16s,18s)',
+  )
+
+  const d = plan.results[3]
+  assert(d.status === 'removed' && d.fragments.length === 0, 'D 完全落入删减段，无片段')
+
+  const e = plan.results[4]
+  assert(
+    e.fragments[0].segStart === 44000 &&
+      e.fragments[0].outStart === 20000 &&
+      e.fragments[0].outEnd === 26000 &&
+      e.fragments[0].shift === 24000,
+    'E 从删减段末端开始，按累计删减 24s 前移到 [20s,26s)',
+  )
+}
+
+console.log('删减清单：相接边界与非正时长字幕')
+{
+  // 末端恰好相接不算相交：字幕 [5s,10s) 与删减段 [10s,20s) 不相扣
+  const touch = computeCutPlan([mkMain(0, 5000, 10000, 'T')], cutRanges)
+  assert(touch.results[0].status === 'kept', '字幕末端恰接删减段起点：原样保留')
+  // 起点恰接删减段末端：字幕保留但按累计删减前移
+  const after = computeCutPlan([mkMain(0, 20000, 25000, 'T')], cutRanges)
+  assert(
+    after.results[0].status === 'shifted' && after.results[0].fragments[0].outStart === 10000,
+    '字幕起点恰接删减段末端：保留并前移 10s',
+  )
+  // 与删减段完全重合：移除
+  const equal = computeCutPlan([mkMain(0, 10000, 20000, 'T')], cutRanges)
+  assert(equal.results[0].status === 'removed', '字幕与删减段完全重合：移除')
+  // 被删减段完全包含：移除
+  const inside = computeCutPlan([mkMain(0, 31000, 32000, 'T')], cutRanges)
+  assert(inside.results[0].status === 'removed', '字幕被删减段完全包含：移除')
+  // 非正时长字幕与删减段相交：移除
+  const degBad = computeCutPlan([mkMain(0, 15000, 15000, 'X')], cutRanges)
+  assert(degBad.results[0].status === 'removed', '零时长字幕落入删减段：移除')
+  // 非正时长字幕不相交：原样保留
+  const degOk = computeCutPlan([mkMain(0, 2000, 2000, 'X')], cutRanges)
+  assert(degOk.results[0].status === 'kept', '零时长字幕不相交：原样保留')
+}
+
+console.log('删减清单：一条字幕被多个删减段切成多个片段')
+{
+  // [8s,45s) 被 [10,20) 与 [30,44) 切成 [8,10) [20,30) [44,45) 三段
+  const plan = computeCutPlan([mkMain(0, 8000, 45000, 'M')], cutRanges)
+  const r = plan.results[0]
+  assert(r.status === 'split' && r.fragments.length === 3, '切成 3 个非空片段')
+  const outs = r.fragments.map((f) => `${f.outStart}-${f.outEnd}/${f.shift}`).join(',')
+  assert(
+    outs === '8000-10000/0,10000-20000/10000,20000-21000/24000',
+    `三段平移量逐段累计正确（实际 ${outs}）`,
+  )
+  assert(r.fragments.every((f) => f.text === 'M'), '每个片段保留原文本')
+}
+
+console.log('删减清单：导出 .cut.srt 从 1 重编号')
+{
+  const plan = computeCutPlan(cutLines, cutRanges)
+  const out = buildCutSrt(plan)
+  const blocks = out.trim().split('\n\n')
+  assert(blocks.length === 5, `导出 5 个片段块（实际 ${blocks.length}）`)
+  const ids = blocks.map((b) => b.split('\n')[0]).join(',')
+  assert(ids === '1,2,3,4,5', '序号按结果顺序从 1 重编号')
+  const texts = blocks.map((b) => b.split('\n').slice(2).join('\n'))
+  assert(texts.join('|') === 'A|B|B|C|E', `片段文本按结果顺序保留（实际 ${texts.join('|')}）`)
+  assert(blocks[1] === '2\n00:00:08,000 --> 00:00:10,000\nB', '第 2 块为 B 的拆分片段 1')
+  assert(blocks[2] === '3\n00:00:10,000 --> 00:00:15,000\nB', '第 3 块为 B 的拆分片段 2（已前移）')
+  assert(!out.includes('D'), '被移除的 D 不写入文件')
+  // 导出结果可重新解析为合法 SRT
+  const reparsed = parseSrt(out)
+  assert(reparsed.cues.length === 5, '导出文件可重新解析为 5 条')
+}
+
+{
+  // 全部移除时导出为空串（界面禁用导出按钮）
+  const plan = computeCutPlan([mkMain(0, 10000, 20000, 'X')], cutRanges)
+  assert(plan.fragmentCount === 0 && buildCutSrt(plan) === '', '无残留片段时导出为空')
+}
+
+{
+  // 小数毫秒校准结果四舍五入写入
+  const fracLines = [mkMain(0, 0, 15000, 'X')]
+  fracLines[0].newEnd = 15000.6
+  const plan = computeCutPlan(fracLines, cutRanges)
+  const out = buildCutSrt(plan)
+  assert(out.includes('00:00:00,000 --> 00:00:10,000'), '片段边界的小数毫秒四舍五入')
+}
+
+console.log('删减清单：锚点变化后实时重算（集成 mapCues）')
+{
+  // 主轨原始字幕 [0,25s)：无锚点时被删减段 [10,20) 拆成 [0,10) / [20,25) 两段；
+  // 设整体延后 10s 的单锚点后校准为 [10,35s)，前段与 [10,20) 完全重合被扣除，
+  // 仅余 [20,30s) 单片段并按累计删减 10s 前移。
+  const base = [{ index: 0, id: '1', start: 0, end: 25000, text: 'X' }]
+  const p0 = computeCutPlan(mapCues(base, []), cutRanges)
+  assert(p0.results[0].status === 'split' && p0.results[0].fragments.length === 2, '无锚点时 [0,25s) 被 [10,20) 拆成两段')
+  const p1 = computeCutPlan(mapCues(base, [{ source: 0, target: 10000 }]), cutRanges)
+  assert(
+    p1.results[0].status === 'shifted' &&
+      p1.results[0].fragments[0].segStart === 20000 &&
+      p1.results[0].fragments[0].outStart === 10000,
+    '锚点变化后同一条字幕重算为单片段并按累计删减前移',
+  )
 }
 
 console.log(failures === 0 ? '\n全部测试通过 ✅' : `\n${failures} 项失败 ❌`)

@@ -978,3 +978,124 @@ body {
     grid-template-columns: 1fr;
   }
 }
+
+/* ---------- 删减清单重排 ---------- */
+.cut-section .merge-rules {
+  margin-bottom: 10px;
+}
+
+.pill-shift {
+  color: #ffd9a1;
+  background: rgba(255, 184, 77, 0.12);
+  border-color: rgba(255, 184, 77, 0.45);
+}
+
+.cut-ranges {
+  margin: 0 0 12px;
+}
+
+.cut-range-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-height: 96px;
+  overflow: auto;
+}
+
+.cut-range-pill {
+  border: 1px solid var(--danger-border);
+  background: var(--danger-bg);
+  color: #ff92a2;
+  border-radius: 6px;
+  padding: 2px 9px;
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
+.cut-range-dur {
+  color: var(--text-faint);
+  margin-left: 2px;
+}
+
+.cut-group {
+  margin-bottom: 12px;
+}
+
+.cut-group:last-child {
+  margin-bottom: 0;
+}
+
+.cut-group-title {
+  margin-bottom: 6px;
+}
+
+.cut-table-wrap {
+  max-height: 30vh;
+  margin-bottom: 0;
+}
+
+.cut-table .pl-no {
+  width: 60px;
+  color: var(--text-faint);
+  text-align: right;
+}
+
+.cut-table .pl-score {
+  width: 110px;
+  white-space: nowrap;
+}
+
+.cut-table .cut-text {
+  max-width: 300px;
+  min-width: 140px;
+}
+
+.cut-table .cue-text {
+  font-size: 12px;
+  max-height: 72px;
+  overflow: hidden;
+}
+
+.cut-frags {
+  min-width: 260px;
+}
+
+.cut-frag-list {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 12px;
+}
+
+.cut-shift {
+  margin-left: 8px;
+  color: var(--warn);
+  font-size: 11.5px;
+}
+
+.cut-shift-cell {
+  color: #ffd9a1;
+}
+
+.cut-errors {
+  font-weight: 400;
+}
+
+.cut-errors-head {
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.cut-error-list {
+  margin: 0;
+  padding-left: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-family: var(--mono);
+  font-size: 12px;
+  max-height: 180px;
+  overflow: auto;
+}
