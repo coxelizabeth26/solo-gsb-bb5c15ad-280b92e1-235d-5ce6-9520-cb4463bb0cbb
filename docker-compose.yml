@@ -1,0 +1,10 @@
+services:
+  srt-aligner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: srt-time-aligner:latest
+    container_name: srt-time-aligner
+    ports:
+      - "8080:80"
+    restart: unless-stopped
